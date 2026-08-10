@@ -8,8 +8,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -17,6 +19,9 @@
 #include "event.hpp"
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
+
+#include "paddle/phi/core/memory/allocation/allocator_facade.h"
+#include "paddle/fluid/distributed/collective/process_group_nccl.h"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME teramoe_cpp
@@ -140,6 +145,9 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
+    phi::distributed::NCCLCommContext* comm_ctx = nullptr;
+    phi::GPUContext* calc_ctx = nullptr;
+    // Declared after the contexts because its constructor lambda assigns them.
     at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
@@ -183,7 +191,8 @@ public:
            bool low_latency_mode,
            bool explicitly_destroy,
            bool enable_shrink,
-           bool use_fabric);
+           bool use_fabric,
+           int context_ring_id = -1);
 
     ~Buffer() noexcept(false);
 
@@ -427,5 +436,12 @@ public:
         int combine_start_head_percent);
 
 };
+
+inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
+                                            phi::GPUContext* ctx) {
+  ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
+                        .GetAllocator(ctx->GetPlace(), stream)
+                        .get());
+}
 
 }  // namespace deep_ep

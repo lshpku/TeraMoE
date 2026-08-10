@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/core/Event.h>
 
 #include <memory>
 
