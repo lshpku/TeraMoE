@@ -71,7 +71,7 @@ def autotune_teramoe(
     num_iters: int = 1000,
     warmup_iters: int = 10,
     verbose: bool = True,
-    group: Optional[dist.ProcessGroup] = None,
+    group=None,
 ) -> Tuple[AutotuneResult, List[Tuple[int, int, float]]]:
     """Grid-search over (compute_batch_size, combine_start_head_percent) and return the fastest combo.
 

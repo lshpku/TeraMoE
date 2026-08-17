@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <ATen/Functions.h>
 #include <cuda_runtime.h>
 #include <pybind11/functional.h>
 #include <torch/python.h>
@@ -9,9 +10,52 @@
 #include <chrono>
 #include <algorithm>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+#include "teramoe/teramoe_alloc.hpp"
+
+// Paddle-backed replacement for `c10::cuda::CUDACachingAllocator::raw_alloc/raw_delete`,
+// used by the TeraMoE orchestrator for long-lived fused-kernel state buffers. Paddle's
+// `AllocatorFacade::Alloc` hands back an owning `AllocationPtr`, so the holder is parked
+// in a table keyed by the raw pointer to emulate torch's raw_alloc/raw_delete pair.
+namespace teramoe_alloc {
+
+namespace {
+std::mutex& alloc_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<void*, paddle::memory::allocation::AllocationPtr>& alloc_table() {
+    static std::unordered_map<void*, paddle::memory::allocation::AllocationPtr> t;
+    return t;
+}
+}  // namespace
+
+void* raw_alloc(size_t nbytes) {
+    if (nbytes == 0)
+        return nullptr;
+    int device_id = 0;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+    auto allocation = paddle::memory::allocation::AllocatorFacade::Instance().Alloc(
+        phi::GPUPlace(device_id), static_cast<size_t>(nbytes));
+    void* ptr = allocation->ptr();
+    std::lock_guard<std::mutex> guard(alloc_mutex());
+    alloc_table()[ptr] = std::move(allocation);
+    return ptr;
+}
+
+void raw_delete(void* ptr) {
+    if (ptr == nullptr)
+        return;
+    std::lock_guard<std::mutex> guard(alloc_mutex());
+    alloc_table().erase(ptr);
+}
+
+}  // namespace teramoe_alloc
 
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
@@ -133,7 +177,8 @@ Buffer::Buffer(int rank,
                bool low_latency_mode,
                bool explicitly_destroy,
                bool enable_shrink,
-               bool use_fabric)
+               bool use_fabric,
+               int context_ring_id)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
@@ -141,7 +186,17 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)),
+      comm_stream([&]() {
+          CUDA_CHECK(cudaGetDevice(&device_id));
+          auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+          paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
+          const auto& place = phi::GPUPlace(device_id);
+          comm_ctx = reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetOrCreateCommContext(
+              place, phi::distributed::CommType::ALLTOALL);
+          calc_ctx = reinterpret_cast<phi::GPUContext*>(
+              reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetDeviceContext(place, true));
+          return at::cuda::getStreamFromExternal(comm_ctx->GetStream(), device_id);
+      }()),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -444,10 +499,10 @@ Buffer::get_dispatch_layout(
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -496,7 +551,7 @@ Buffer::get_dispatch_layout(
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream.stream(), calc_ctx);
 
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
 }
@@ -605,10 +660,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -798,7 +853,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream.stream(), calc_ctx);
 
     // Return values
     return {recv_x,
@@ -849,10 +904,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -950,7 +1005,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream.stream(), calc_ctx);
 
     return {recv_x, recv_topk_weights, event};
 }
@@ -1085,10 +1140,10 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1328,7 +1383,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream.stream(), calc_ctx);
 
     // Return values
     return {recv_x,
@@ -1402,10 +1457,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        at::cuda::setCurrentCUDAStream(comm_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1531,7 +1586,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Switch back compute stream
     if (allocate_on_comm_stream)
-        at::cuda::setCurrentCUDAStream(compute_stream);
+        deep_ep::SetAllocatorStreamForGPUContext(compute_stream.stream(), calc_ctx);
 
     // Return values
     return {combined_x, combined_topk_weights, event};
@@ -2244,7 +2299,7 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
     // remains as a safety net.
 
     const int max_tokens_per_expert = std::max(1, max_total_recv_tokens);
-    AT_CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaGetLastError());
 
     // Per-local-expert received-token counts for compact slot packing (P0 forward path).
     // moe_recv_expert_counter was populated by notify_dispatch above and equals each local
@@ -2333,7 +2388,7 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
 
     void* state = static_cast<void*>(allocate_state(::teramoe::allocate_teramoe_fused_state));
 
-    AT_CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaGetLastError());
 
     // Compute shared memory size
     // Match internode.cu dispatch/combine dynamic shared memory requirements.
@@ -2348,7 +2403,7 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
         int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
-        // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        // CUDA_CHECK(cudaStreamSynchronize(stream));
         // internode::barrier();
     }
 
@@ -2356,8 +2411,8 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
         static_cast<::teramoe::TeraMoEState*>(state),
         fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
-    AT_CUDA_CHECK(cudaGetLastError());
-    AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::shared_ptr<TeraMoEAutogradContext> context;
     if (retain_state) {
@@ -2543,7 +2598,7 @@ Buffer::teramoe_backward(
         int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
-        // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        // CUDA_CHECK(cudaStreamSynchronize(stream));
         // internode::barrier();
     }
 
@@ -2573,7 +2628,7 @@ Buffer::teramoe_backward(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "TeraMOE: a cross-node Mixture-of-Experts (MoE) training engine";
 
-    pybind11::class_<deep_ep::Config>(m, "Config")
+    pybind11::class_<deep_ep::Config>(m, "Config", py::module_local())
         .def(pybind11::init<int, int, int, int, int>(),
              py::arg("num_sms") = 20,
              py::arg("num_max_nvl_chunked_send_tokens") = 6,
@@ -2584,16 +2639,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
-    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle", py::module_local())
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::TeraMoEAutogradContext,
                      std::shared_ptr<deep_ep::TeraMoEAutogradContext>>(
-        m, "TeraMoEAutogradContext");
+        m, "TeraMoEAutogradContext", py::module_local());
 
-    pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
+    pybind11::class_<deep_ep::Buffer>(m, "Buffer", py::module_local())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
@@ -2602,7 +2657,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
+        .def("get_comm_stream",
+           [](deep_ep::Buffer &self) {
+             int device_id = self.get_local_device_id();
+             cudaStream_t comm_stream = at::cuda::CUDAStream(self.get_comm_stream()).stream();
+             auto s = phi::Stream(reinterpret_cast<phi::StreamId>(comm_stream));
+#if defined(PADDLE_WITH_CUDA)
+             return phi::CUDAStream(phi::GPUPlace(device_id), s);
+#endif
+           })
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)

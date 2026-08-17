@@ -19,7 +19,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
-#include <c10/cuda/CUDACachingAllocator.h>
+#include "teramoe_alloc.hpp"
 #include <c10/cuda/CUDAStream.h>
 
 namespace teramoe {
@@ -3138,15 +3138,15 @@ void launch_teramoe_fused_forward_impl(
 }
 
 
-// Use PyTorch's CUDA caching allocator for long-lived fused-kernel state buffers.
+// Use Paddle's CUDA caching allocator for long-lived fused-kernel state buffers.
 static inline cudaError_t teramoe_caching_alloc(void** pp, size_t nbytes) {
-    *pp = (nbytes == 0) ? nullptr : c10::cuda::CUDACachingAllocator::raw_alloc(nbytes);
+    *pp = (nbytes == 0) ? nullptr : ::teramoe_alloc::raw_alloc(nbytes);
     return cudaSuccess;
 }
 
 static inline cudaError_t teramoe_caching_free(void* ptr) {
     if (ptr != nullptr)
-        c10::cuda::CUDACachingAllocator::raw_delete(ptr);
+        ::teramoe_alloc::raw_delete(ptr);
     return cudaSuccess;
 }
 
