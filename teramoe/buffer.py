@@ -714,7 +714,7 @@ class Buffer:
         def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
                     num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
                     dispatch_config, combine_config, grad_topk_weights,
-                    compute_batch_size, combine_start_head_percent):
+                    compute_batch_size, combine_start_head_percent, debug_sink=None):
             output, handle = runtime.teramoe_forward_train(
                 x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
                 num_dispatch_sms, num_combine_sms, total_sms, stage,
@@ -722,6 +722,11 @@ class Buffer:
                 compute_batch_size, combine_start_head_percent)
             ctx.runtime = runtime
             ctx.handle = handle
+            # DEBUG BRANCH ONLY: expose the handle to the Python caller so it can read
+            # the in-kernel event log before backward frees the state. `debug_sink` is a
+            # plain list (non-tensor arg, ignored by autograd's gradient bookkeeping).
+            if debug_sink is not None:
+                debug_sink.append(handle)
             ctx.grad_topk_weights = grad_topk_weights
             # Only retain tensors whose underlying storage the backward C++ code
             # dereferences via raw pointers cached in the forward state.
@@ -806,11 +811,55 @@ class Buffer:
         if grad_topk_weights is None:
             grad_topk_weights = torch.zeros(
                 (x.size(0), topk_weights.size(1)), dtype=torch.float32, device=topk_weights.device)
-        return self._TeraMoEAutogradFunction.apply(
+        debug_sink = []
+        output = self._TeraMoEAutogradFunction.apply(
             self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
             dispatch_config, combine_config, grad_topk_weights,
-            compute_batch_size, combine_start_head_percent)
+            compute_batch_size, combine_start_head_percent, debug_sink)
+        # DEBUG BRANCH ONLY: dump the in-kernel event timeline to disk right after the
+        # forward megakernel completes (the handle/state is still alive here). Guarded so
+        # it is a no-op unless TERAMOE_DEBUG_EVENTS is set.
+        if os.getenv("TERAMOE_DEBUG_EVENTS", "0") not in ("0", "", "false", "False") and debug_sink:
+            self._dump_teramoe_debug_events(debug_sink[0])
+        return output
+
+    def _dump_teramoe_debug_events(self, handle):
+        """DEBUG BRANCH ONLY: read the in-kernel event log from the handle and save to disk.
+
+        Record layout mirrors ``MkDbgEvent`` in teramoe_orchestrator.cu:
+            struct { uint64 ts; int32 type; int32 sm_id; int32 aux0; int32 aux1; }  # 24 bytes
+        Event types: 1=dispatch_start 2=dispatch_end 3=compute_task_start
+                      4=compute_task_end 5=combine_start 6=combine_end
+        `ts` is %globaltimer nanoseconds (device-global timebase). `aux0`/`aux1` are
+        role-specific: dispatch -> (dispatch_sm_idx, -1); compute -> (group_id, task_idx);
+        combine -> (combine_role_idx, -1). Output goes to
+        ${TERAMOE_DEBUG_EVENTS_DIR:-.}/teramoe_debug_events_rank{rank}.npy as a numpy
+        structured array.
+        """
+        import numpy as np
+
+        count = int(handle.debug_event_count())
+        raw = handle.debug_events()  # CPU uint8 tensor, count * 24 bytes
+        try:
+            buf = raw.numpy()
+        except Exception:
+            buf = np.asarray(raw)
+        buf = np.ascontiguousarray(buf).view(np.uint8)
+
+        dt = np.dtype([
+            ('ts', '<u8'), ('type', '<i4'), ('sm_id', '<i4'),
+            ('aux0', '<i4'), ('aux1', '<i4'),
+        ])
+        n = min(count, buf.nbytes // dt.itemsize)
+        events = buf[: n * dt.itemsize].view(dt) if n > 0 else np.empty(0, dt)
+
+        rank = getattr(self, 'rank', 0)
+        out_dir = os.getenv("TERAMOE_DEBUG_EVENTS_DIR", ".")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"teramoe_debug_events_rank{rank}.npy")
+        np.save(path, events)
+        print(f"[teramoe-debug] saved {n} events (reported count={count}) to {path}", flush=True)
 
     def teramoe_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                                  W_gateup: torch.Tensor, W_down: torch.Tensor,

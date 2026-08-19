@@ -99,6 +99,9 @@ struct MegaKernelBackwardState;
 // stays well under this cap for realistic cases.
 constexpr int kMegakernelArenaChunkCap = 128;
 
+// DEBUG BRANCH ONLY: forward-declared here so TeraMoEState can hold a pointer.
+struct MkDbgEvent;
+
 struct TeraMoEState {
     int* timeout_log_counters;        // [kTimeoutLogCount] per-site bounded logging budget
     // --- DeepEP NVSHMEM infrastructure (from Buffer object) ---
@@ -319,6 +322,14 @@ struct TeraMoEState {
     // Backing store for the fused buffer-init descriptors (see fused_fill_kernel). Freed with the state.
     void* fused_fill_desc_buf;
 
+    // --- DEBUG BRANCH ONLY: in-kernel event timeline log ---
+    // Elected threads append {globaltimer, type, sm, aux0, aux1} records to dbg_events,
+    // reserving a slot via atomicAdd(dbg_event_head). Read back on the host after the kernel
+    // completes. Allocated in the persistent arena so it is freed together with the state.
+    MkDbgEvent* dbg_events;           // [dbg_event_capacity]
+    int* dbg_event_head;              // atomic append cursor (may exceed capacity; clamp on read)
+    int dbg_event_capacity;           // number of record slots
+
     // --- Owned arena bookkeeping ---
     void* persistent_arena_chunks[kMegakernelArenaChunkCap];
     int persistent_arena_chunk_count;
@@ -332,6 +343,43 @@ constexpr int kNumDispatchRDMASenderWarps = 7;
 constexpr int kNumTMABytesPerWarp = 16384;
 constexpr bool kLowLatencyMode = false;
 constexpr bool kCachedMode = false;
+
+// ============================================================================
+// DEBUG BRANCH ONLY — in-kernel event timeline instrumentation.
+// NOT for production. Records per-role/per-task start/end with a GPU-global
+// timestamp (%globaltimer, consistent across SMs, unlike per-SM clock64()).
+// A single shared atomic reserves the slot; the timestamp is read BEFORE the
+// atomic so contention latency never pollutes the measured time. Event volume
+// is low (leader-only, role/task granularity), so one global atomic is fine.
+// ============================================================================
+struct MkDbgEvent {
+    unsigned long long ts;  // %globaltimer nanoseconds (device-global timebase)
+    int type;               // MkDbgEventType
+    int sm_id;              // blockIdx.x (global block/SM id)
+    int aux0;               // role-specific (dispatch_sm_idx / compute group_id / combine role_idx)
+    int aux1;               // role-specific (compute task_idx; -1 otherwise)
+};
+enum MkDbgEventType {
+    kDbgDispatchStart    = 1,
+    kDbgDispatchEnd      = 2,
+    kDbgComputeTaskStart = 3,
+    kDbgComputeTaskEnd   = 4,
+    kDbgCombineStart     = 5,
+    kDbgCombineEnd       = 6,
+};
+__device__ __forceinline__ void mk_dbg_log(TeraMoEState* state, int type,
+                                           int sm_id, int aux0, int aux1) {
+    if (state->dbg_events == nullptr || state->dbg_event_head == nullptr)
+        return;
+    unsigned long long ts;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+    int slot = atomicAdd(state->dbg_event_head, 1);
+    if (slot >= 0 && slot < state->dbg_event_capacity) {
+        MkDbgEvent e;
+        e.ts = ts; e.type = type; e.sm_id = sm_id; e.aux0 = aux0; e.aux1 = aux1;
+        state->dbg_events[slot] = e;
+    }
+}
 
 __device__ __forceinline__ int get_publish_warp_index(int dispatch_sm_idx, int src_nvl_rank) {
     return (dispatch_sm_idx / 2) * NUM_MAX_NVL_PEERS + src_nvl_rank;
@@ -540,6 +588,10 @@ __device__ void dispatch_worker(
     const bool is_forwarder = dispatch_sm_idx % 2 == 0;
     const auto rdma_rank = state->rank / NUM_MAX_NVL_PEERS, nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
     const auto num_ranks = state->num_ranks;
+
+    // DEBUG BRANCH: dispatch role start (comms phase begins), one record per dispatch SM.
+    if (thread_id == 0)
+        mk_dbg_log(state, kDbgDispatchStart, blockIdx.x, dispatch_sm_idx, -1);
 
     constexpr int kDispatchWorkerWarps = kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS;
     EP_DEVICE_ASSERT(num_warps >= kDispatchWorkerWarps);
@@ -1360,6 +1412,11 @@ __device__ void dispatch_worker(
     asm volatile("barrier.sync 15, %0;" :: "r"(num_threads));
 
 
+    // DEBUG BRANCH: dispatch role end (comms drained), logged just before this SM
+    // is recycled into a compute group by MK_DISPATCH_REUSED_COMPUTE below.
+    if (thread_id == 0)
+        mk_dbg_log(state, kDbgDispatchEnd, blockIdx.x, dispatch_sm_idx, -1);
+
     const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
     const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
     MK_DISPATCH_REUSED_COMPUTE(
@@ -1750,6 +1807,11 @@ __device__ __forceinline__ void compute_worker_core(
         int start_slot = task.start_slot;
         int batch_size = task.num_tokens;
 
+        // DEBUG BRANCH: compute task start, logged once per group by its leader.
+        // aux0 = compute group_id (0..num_compute_groups-1), aux1 = task_idx.
+        if (group_sm_idx == 0 && thread_id == 0)
+            mk_dbg_log(state, kDbgComputeTaskStart, blockIdx.x, group_id, task_idx);
+
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
         static_assert(kUseUmmaCompute, "WMMA compute path removed; MK_COMPUTE_KERNEL must be 1 (1-CTA) or 2 (2-CTA UMMA)");
         const bool use_umma_gateup_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
@@ -1902,6 +1964,9 @@ __device__ __forceinline__ void compute_worker_core(
             compute_group_sync(state, group_id, group_size);
         }
 
+        // DEBUG BRANCH: compute task end, logged once per group by its leader.
+        if (group_sm_idx == 0 && thread_id == 0)
+            mk_dbg_log(state, kDbgComputeTaskEnd, blockIdx.x, group_id, task_idx);
 
     }
 }
@@ -3019,7 +3084,13 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
         case SmRole::kCombine:
             combine_precompute_worker<kComputeDType>(sm_id, role_idx, num_combine_sms, state, smem_buffer);
+            // DEBUG BRANCH: combine comms start (after the precompute "borrow" phase ends).
+            if (threadIdx.x == 0)
+                mk_dbg_log(state, kDbgCombineStart, blockIdx.x, role_idx, -1);
             combine_worker<kNumRDMARanks, kStage>(role_idx, state);
+            // DEBUG BRANCH: combine comms end.
+            if (threadIdx.x == 0)
+                mk_dbg_log(state, kDbgCombineEnd, blockIdx.x, role_idx, -1);
             break;
 
         case SmRole::kScheduler:
@@ -3367,6 +3438,20 @@ TeraMoEState* allocate_teramoe_fused_state(
         return cudaSuccess;
     };
 #define cudaMemset(p, v, n) record_deferred_fill((p), (v), (n))
+
+    // ---- DEBUG BRANCH ONLY: allocate the giant in-kernel event log ----
+    // Brute-force 1 GB buffer in the PERSISTENT arena so it lives as long as the
+    // state (freed by free_teramoe_fused_state, survives the forward->handle read).
+    // Only the head counter is zero-filled (deferred into fused_fill_kernel); the
+    // 1 GB payload is left uninitialized since only slots [0, head) are read back.
+    MkDbgEvent* dbg_events = nullptr;
+    int* dbg_event_head = nullptr;
+    const size_t kDbgEventBytes = (size_t)1024 * 1024 * 1024;  // 1 GB
+    const int dbg_event_capacity = (int)(kDbgEventBytes / sizeof(MkDbgEvent));
+    arena = &persistent_arena;
+    CUDA_CHECK(cudaMalloc(&dbg_events, (size_t)dbg_event_capacity * sizeof(MkDbgEvent)));
+    CUDA_CHECK(cudaMalloc(&dbg_event_head, sizeof(int)));
+    CUDA_CHECK(cudaMemset(dbg_event_head, 0, sizeof(int)));  // deferred -> fused_fill_kernel
 
     // Allocate workspace buffers on device
     int* expert_recv_count;
@@ -4108,6 +4193,11 @@ TeraMoEState* allocate_teramoe_fused_state(
     }
     host_state.fused_fill_desc_buf = fill_desc_buf;
 
+    // DEBUG BRANCH: publish the event-log pointers into the state copied to device.
+    host_state.dbg_events = dbg_events;
+    host_state.dbg_event_head = dbg_event_head;
+    host_state.dbg_event_capacity = dbg_event_capacity;
+
     // Copy state + fill descs to device in one async batch on the current stream.
     cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
     TeraMoEState* device_state;
@@ -4373,6 +4463,26 @@ void* get_combined_x_ptr(TeraMoEState* device_state) {
     TeraMoEState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(TeraMoEState), cudaMemcpyDeviceToHost));
     return host_state.combined_x;
+}
+
+// ---- DEBUG BRANCH ONLY: event-log readback helpers ----
+int teramoe_debug_event_record_bytes() {
+    return static_cast<int>(sizeof(MkDbgEvent));
+}
+int teramoe_debug_event_count(const TeraMoEState* host_state) {
+    if (host_state == nullptr || host_state->dbg_event_head == nullptr)
+        return 0;
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, host_state->dbg_event_head, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count < 0) count = 0;
+    if (count > host_state->dbg_event_capacity) count = host_state->dbg_event_capacity;
+    return count;
+}
+void teramoe_debug_copy_events(const TeraMoEState* host_state, void* dst_host, int count) {
+    if (host_state == nullptr || host_state->dbg_events == nullptr || dst_host == nullptr || count <= 0)
+        return;
+    CUDA_CHECK(cudaMemcpy(dst_host, host_state->dbg_events,
+                          static_cast<size_t>(count) * sizeof(MkDbgEvent), cudaMemcpyDeviceToHost));
 }
 
 // Keep the public fused-forward wrapper adjacent to its implementation so both

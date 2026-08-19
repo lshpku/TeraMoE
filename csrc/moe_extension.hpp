@@ -82,6 +82,12 @@ public:
     const std::vector<int>& expert_counts() const { return expert_counts_; }
     int num_recv_tokens() const { return num_recv_tokens_; }
 
+    // DEBUG BRANCH ONLY: read back the in-kernel event timeline log.
+    // debug_event_count() returns the number of recorded events (clamped to capacity);
+    // debug_events() returns a CPU uint8 tensor of count * record_bytes raw records.
+    int debug_event_count() const;
+    torch::Tensor debug_events() const;
+
     // Host-side snapshot of the forward TeraMoEState, captured at forward-end.
     // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
     // the device state, eliminating the most expensive host stall in the backward path.

@@ -1985,6 +1985,30 @@ void TeraMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> te
     retained_layout_tensors_ = std::move(tensors);
 }
 
+int TeraMoEAutogradContext::debug_event_count() const {
+#ifndef DISABLE_NVSHMEM
+    if (cached_host_state_ == nullptr)
+        return 0;
+    return ::teramoe::teramoe_debug_event_count(cached_host_state_);
+#else
+    return 0;
+#endif
+}
+
+torch::Tensor TeraMoEAutogradContext::debug_events() const {
+    auto out_opts = torch::dtype(torch::kUInt8).device(torch::kCPU);
+#ifndef DISABLE_NVSHMEM
+    const int count = debug_event_count();
+    const int rec_bytes = ::teramoe::teramoe_debug_event_record_bytes();
+    auto out = torch::empty({static_cast<int64_t>(count) * rec_bytes}, out_opts);
+    if (count > 0)
+        ::teramoe::teramoe_debug_copy_events(cached_host_state_, out.data_ptr(), count);
+    return out;
+#else
+    return torch::empty({0}, out_opts);
+#endif
+}
+
 std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teramoe_fused_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
@@ -2625,7 +2649,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      std::shared_ptr<deep_ep::TeraMoEAutogradContext>>(
         m, "TeraMoEAutogradContext", py::module_local())
         .def("num_recv_tokens", &deep_ep::TeraMoEAutogradContext::num_recv_tokens)
-        .def("expert_counts", &deep_ep::TeraMoEAutogradContext::expert_counts);
+        .def("expert_counts", &deep_ep::TeraMoEAutogradContext::expert_counts)
+        .def("debug_event_count", &deep_ep::TeraMoEAutogradContext::debug_event_count)
+        .def("debug_events", &deep_ep::TeraMoEAutogradContext::debug_events);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer", py::module_local())
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int>())

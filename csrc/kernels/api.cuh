@@ -458,6 +458,13 @@ void get_megakernel_expert_counts(
 int get_teramoe_compute_batch_size_default();
 float* get_output_accum_ptr(TeraMoEState* device_state);
 void* get_combined_x_ptr(TeraMoEState* device_state);
+
+// DEBUG BRANCH ONLY: read back the in-kernel event log. `host_state` is a host-side
+// snapshot of TeraMoEState (e.g. the context's cached host state) whose dbg_* fields
+// point at device memory.
+int teramoe_debug_event_record_bytes();
+int teramoe_debug_event_count(const TeraMoEState* host_state);
+void teramoe_debug_copy_events(const TeraMoEState* host_state, void* dst_host, int count);
 void launch_teramoe_fused_forward(
     TeraMoEState* device_state,
     const TeraMoEState* host_state,
